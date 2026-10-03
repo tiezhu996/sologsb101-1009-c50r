@@ -8,6 +8,8 @@ import { useStationStore } from './stores/stationStore'
 import { usePatrolStore } from './stores/patrolStore'
 import { useLeakStore } from './stores/leakStore'
 import { usePatrolGap } from './hooks/usePatrolGap'
+import { useIsolationStore } from './stores/isolationStore'
+import { useSyncStore } from './stores/syncStore'
 
 export default function App() {
   const location = useLocation()
@@ -15,6 +17,8 @@ export default function App() {
   const stationStore = useStationStore()
   const patrolStore = usePatrolStore()
   const leakStore = useLeakStore()
+  const isolationStore = useIsolationStore()
+  const syncStore = useSyncStore()
   const gap = usePatrolGap(patrolStore.patrols)
 
   const currentStation = stationStore.currentStation()
@@ -25,6 +29,7 @@ export default function App() {
     { path: ROUTES.patrols, label: '巡检录入', count: patrolStore.patrols.length },
     { path: ROUTES.abnormal, label: '异常分级', count: patrolStore.abnormalRows().length },
     { path: ROUTES.leaks, label: '泄漏处置', count: leakStore.counts()['待处置'] },
+    { path: ROUTES.sync, label: '回传对账', count: syncStore.conflicts.length + isolationStore.pendingReviewCount() },
     { path: ROUTES.plans, label: '巡检计划', count: gap.overdueCount }
   ]
 

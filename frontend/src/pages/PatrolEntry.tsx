@@ -252,7 +252,48 @@ export default function PatrolEntry() {
                   <div className="card-list-item__meta">
                     <span style={{ color: item.overdue ? '#f53f3f' : undefined }}>{item.text}</span>
                   </div>
+                  <div className="card-list-item__meta">
+                    <Tag size="small" color={patrol.fieldState === '已录读' ? 'arcoblue' : 'gray'}>
+                      现场·{patrol.fieldState ?? '待录入'}
+                    </Tag>
+                    <Tag size="small" color={patrol.dutyState === '已放行' ? 'green' : patrol.dutyState === '已接收' ? 'purple' : 'gray'}>
+                      值班·{patrol.dutyState ?? '待接收'}
+                    </Tag>
+                  </div>
                   <div className="card-list-item__meta" style={{ gap: 8 }}>
+                    <Button
+                      type="text"
+                      size="small"
+                      disabled={patrol.fieldState === '已录读'}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        void patrolStore.markFieldRecorded(patrol.id, '现场测点读数已录，随回传包提交').then(() => Message.success('现场态已置「已录读」'))
+                      }}
+                    >
+                      现场录完
+                    </Button>
+                    <Button
+                      type="text"
+                      size="small"
+                      disabled={patrol.dutyState !== '待接收'}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        void patrolStore.advanceDuty(patrol.id, '已接收', '值班室已接收回传包').then(() => Message.success('值班态已置「已接收」'))
+                      }}
+                    >
+                      值班接收
+                    </Button>
+                    <Button
+                      type="text"
+                      size="small"
+                      disabled={patrol.dutyState === '已放行' || patrol.dutyState === '待接收'}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        void patrolStore.advanceDuty(patrol.id, '已放行', '复检通过，值班放行').then(() => Message.success('值班态已置「已放行」'))
+                      }}
+                    >
+                      复检放行
+                    </Button>
                     <Button
                       type="text"
                       size="small"

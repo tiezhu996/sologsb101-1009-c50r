@@ -10,10 +10,12 @@ import type { Point } from '@/types/point'
 import type { Patrol } from '@/types/patrol'
 import type { Reading } from '@/types/reading'
 import type { Leak } from '@/types/leak'
+import type { IsolationTicket } from '@/types/isolation'
+import type { SyncBatch, SyncConflict } from '@/types/sync'
 import { deviationPctOf, judgeReading } from '@/utils/range'
 
 export const DB_NAME = 'gbgaspress'
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 export const LS_KEYS = {
   dbVersion: 'gbgaspress:db-version',
@@ -38,13 +40,14 @@ export interface BackupPayload {
   patrols: Patrol[]
   readings: Reading[]
   leaks: Leak[]
+  isolations: IsolationTicket[]
 }
 
 export interface Revisioned {
   revision?: number
 }
 
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 export type StationRow = Station & Revisioned
 export type DeviceRow = Device & Revisioned
@@ -52,6 +55,9 @@ export type PointRow = Point & Revisioned
 export type PatrolRow = Patrol & Revisioned
 export type ReadingRow = Reading & Revisioned
 export type LeakRow = Leak & Revisioned
+export type IsolationRow = IsolationTicket & Revisioned
+export type SyncBatchRow = SyncBatch & Revisioned
+export type SyncConflictRow = SyncConflict & Revisioned
 
 class GasPressDatabase extends Dexie {
   stations!: Table<StationRow, string>
@@ -60,6 +66,9 @@ class GasPressDatabase extends Dexie {
   patrols!: Table<PatrolRow, string>
   readings!: Table<ReadingRow, string>
   leaks!: Table<LeakRow, string>
+  isolationTickets!: Table<IsolationRow, string>
+  syncBatches!: Table<SyncBatchRow, string>
+  syncConflicts!: Table<SyncConflictRow, string>
 
   constructor() {
     super(DB_NAME)
@@ -147,6 +156,54 @@ class GasPressDatabase extends Dexie {
             }
           })
       })
+
+    // v3：双轨状态（现场/值班）+ 隔离作业票 + 回传对账批次/冲突表
+    this.version(DB_VERSION)
+      .stores({
+        stations: 'id, name, grade, updatedAt',
+        devices: 'id, stationId, type, state, updatedAt',
+        points: 'id, deviceId, stationId, name, isCritical, updatedAt',
+        patrols: 'id, stationId, planDate, state, fieldState, dutyState, updatedAt',
+        readings: 'id, patrolId, pointId, isAbnormal, updatedAt',
+        leaks: 'id, deviceId, stationId, state, handler, dupOf, needsReview, updatedAt',
+        isolationTickets: 'id, leakId, deviceId, stationId, fieldState, dutyState, ticketNo, updatedAt',
+        syncBatches: 'id, packageId, state, origin, createdAt',
+        syncConflicts: 'id, batchId, entity, resolution, naturalKey, createdAt'
+      })
+      .upgrade(async (tx) => {
+        // 既有行补 revision
+        for (const name of ['stations', 'devices', 'points', 'patrols', 'readings', 'leaks']) {
+          await tx
+            .table(name)
+            .toCollection()
+            .modify((row: Record<string, unknown>) => {
+              row.revision = ROW_REVISION
+            })
+        }
+
+        // 巡检双轨状态回填：已完成 → 现场已录读；值班默认待接收
+        await tx
+          .table('patrols')
+          .toCollection()
+          .modify((patrol: Record<string, unknown>) => {
+            if (patrol.fieldState === undefined) {
+              patrol.fieldState = patrol.state === '已完成' ? '已录读' : '待录入'
+            }
+            if (patrol.dutyState === undefined) patrol.dutyState = '待接收'
+            if (typeof patrol.fieldMeasure !== 'string') patrol.fieldMeasure = ''
+            if (typeof patrol.dutyReleaseNote !== 'string') patrol.dutyReleaseNote = ''
+          })
+
+        // 泄漏单补同步溯源字段
+        await tx
+          .table('leaks')
+          .toCollection()
+          .modify((leak: Record<string, unknown>) => {
+            if (typeof leak.importPackageId !== 'string') leak.importPackageId = ''
+            if (typeof leak.dupOf !== 'string') leak.dupOf = ''
+            if (typeof leak.needsReview !== 'boolean') leak.needsReview = false
+          })
+      })
   }
 }
 
@@ -190,12 +247,12 @@ const SEED_POINTS: PointRow[] = [
 ]
 
 const SEED_PATROLS: PatrolRow[] = [
-  { id: 'pa-1', stationId: 'st-1', planDate: '2024-06-05', patrolDate: '2024-06-05', patrolman: '张伟', envNote: '晴，气温 26℃', state: '已完成', createdAt: stamp(-15), updatedAt: stamp(-15), revision: ROW_REVISION },
-  { id: 'pa-2', stationId: 'st-1', planDate: '2024-06-12', patrolDate: '2024-06-12', patrolman: '张伟', envNote: '多云，风力 3 级', state: '已完成', createdAt: stamp(-8), updatedAt: stamp(-8), revision: ROW_REVISION },
-  { id: 'pa-3', stationId: 'st-1', planDate: '2024-06-19', patrolDate: '', patrolman: '', envNote: '', state: '待巡检', createdAt: stamp(-1), updatedAt: stamp(-1), revision: ROW_REVISION },
-  { id: 'pa-4', stationId: 'st-2', planDate: '2024-06-06', patrolDate: '2024-06-08', patrolman: '李娜', envNote: '中雨，到场延迟 2 天', state: '已完成', createdAt: stamp(-14), updatedAt: stamp(-12), revision: ROW_REVISION },
-  { id: 'pa-5', stationId: 'st-2', planDate: '2024-06-13', patrolDate: '', patrolman: '李娜', envNote: '计划未执行，人员调休', state: '漏检', createdAt: stamp(-7), updatedAt: stamp(-6), revision: ROW_REVISION },
-  { id: 'pa-6', stationId: 'st-2', planDate: '2024-06-20', patrolDate: '', patrolman: '', envNote: '', state: '待巡检', createdAt: stamp(-1), updatedAt: stamp(-1), revision: ROW_REVISION }
+  { id: 'pa-1', stationId: 'st-1', planDate: '2024-06-05', patrolDate: '2024-06-05', patrolman: '张伟', envNote: '晴，气温 26℃', state: '已完成', fieldState: '已录读', dutyState: '已放行', fieldMeasure: '阀体密封垫更换后测漏正常', dutyReleaseNote: '复检 32ppm，值班放行', createdAt: stamp(-15), updatedAt: stamp(-15), revision: ROW_REVISION },
+  { id: 'pa-2', stationId: 'st-1', planDate: '2024-06-12', patrolDate: '2024-06-12', patrolman: '张伟', envNote: '多云，风力 3 级', state: '已完成', fieldState: '已录读', dutyState: '已接收', fieldMeasure: '法兰螺栓紧固并涂抹检漏液', dutyReleaseNote: '', createdAt: stamp(-8), updatedAt: stamp(-8), revision: ROW_REVISION },
+  { id: 'pa-3', stationId: 'st-1', planDate: '2024-06-19', patrolDate: '', patrolman: '', envNote: '', state: '待巡检', fieldState: '待录入', dutyState: '待接收', fieldMeasure: '', dutyReleaseNote: '', createdAt: stamp(-1), updatedAt: stamp(-1), revision: ROW_REVISION },
+  { id: 'pa-4', stationId: 'st-2', planDate: '2024-06-06', patrolDate: '2024-06-08', patrolman: '李娜', envNote: '中雨，到场延迟 2 天', state: '已完成', fieldState: '已录读', dutyState: '待接收', fieldMeasure: '', dutyReleaseNote: '', createdAt: stamp(-14), updatedAt: stamp(-12), revision: ROW_REVISION },
+  { id: 'pa-5', stationId: 'st-2', planDate: '2024-06-13', patrolDate: '', patrolman: '李娜', envNote: '计划未执行，人员调休', state: '漏检', fieldState: '待录入', dutyState: '待接收', fieldMeasure: '', dutyReleaseNote: '', createdAt: stamp(-7), updatedAt: stamp(-6), revision: ROW_REVISION },
+  { id: 'pa-6', stationId: 'st-2', planDate: '2024-06-20', patrolDate: '', patrolman: '', envNote: '', state: '待巡检', fieldState: '待录入', dutyState: '待接收', fieldMeasure: '', dutyReleaseNote: '', createdAt: stamp(-1), updatedAt: stamp(-1), revision: ROW_REVISION }
 ]
 
 /** 播种用的读数原始行：[巡检, 点位, 读数, 备注] */
@@ -214,9 +271,61 @@ const SEED_READING_ROWS: Array<[string, string, number, string]> = [
 ]
 
 const SEED_LEAKS: LeakRow[] = [
-  { id: 'lk-1', deviceId: 'dv-1', stationId: 'st-1', concentrationPpm: 68, foundTime: '2024-06-05', measure: '更换调压器阀体密封垫并做气密试验', state: '已复检', retestValuePpm: 32, handler: '张伟', createdAt: stamp(-15), updatedAt: stamp(-10), revision: ROW_REVISION },
-  { id: 'lk-2', deviceId: 'dv-2', stationId: 'st-1', concentrationPpm: 55, foundTime: '2024-06-12', measure: '紧固法兰螺栓并涂抹检漏液复测', state: '已处置', retestValuePpm: 0, handler: '张伟', createdAt: stamp(-8), updatedAt: stamp(-6), revision: ROW_REVISION },
-  { id: 'lk-3', deviceId: 'dv-4', stationId: 'st-2', concentrationPpm: 88, foundTime: '2024-06-08', measure: '', state: '待处置', retestValuePpm: 0, handler: '', createdAt: stamp(-12), updatedAt: stamp(-12), revision: ROW_REVISION }
+  { id: 'lk-1', deviceId: 'dv-1', stationId: 'st-1', concentrationPpm: 68, foundTime: '2024-06-05', measure: '更换调压器阀体密封垫并做气密试验', state: '已复检', retestValuePpm: 32, handler: '张伟', importPackageId: '', dupOf: '', needsReview: false, createdAt: stamp(-15), updatedAt: stamp(-10), revision: ROW_REVISION },
+  { id: 'lk-2', deviceId: 'dv-2', stationId: 'st-1', concentrationPpm: 55, foundTime: '2024-06-12', measure: '紧固法兰螺栓并涂抹检漏液复测', state: '已处置', retestValuePpm: 0, handler: '张伟', importPackageId: '', dupOf: '', needsReview: false, createdAt: stamp(-8), updatedAt: stamp(-6), revision: ROW_REVISION },
+  { id: 'lk-3', deviceId: 'dv-4', stationId: 'st-2', concentrationPpm: 88, foundTime: '2024-06-08', measure: '', state: '待处置', retestValuePpm: 0, handler: '', importPackageId: '', dupOf: '', needsReview: false, createdAt: stamp(-12), updatedAt: stamp(-12), revision: ROW_REVISION }
+]
+
+/** 隔离作业票播种：lk-1 双轨闭环、lk-2 现场已处置待值班复检、lk-3 尚未开票 */
+const SEED_ISOLATIONS: IsolationRow[] = [
+  {
+    id: 'iso-1',
+    leakId: 'lk-1',
+    deviceId: 'dv-1',
+    stationId: 'st-1',
+    ticketNo: 'ISO-20240605-A1',
+    fieldState: '待复检',
+    leakTestPpm: 68,
+    fieldMeasure: '更换调压器阀体密封垫并做气密试验',
+    fieldHandler: '张伟',
+    leakTestTime: '2024-06-05 22:40',
+    dutyState: '已放行',
+    isolationScope: '1# 调压器进出口双阀之间管段，关闭进出口球阀并放散',
+    retestPpm: 32,
+    released: true,
+    dutyHandler: '王强',
+    releasedAt: '2024-06-06 01:15',
+    importPackageId: '',
+    dupOf: '',
+    needsReview: false,
+    createdAt: stamp(-15),
+    updatedAt: stamp(-10),
+    revision: ROW_REVISION
+  },
+  {
+    id: 'iso-2',
+    leakId: 'lk-2',
+    deviceId: 'dv-2',
+    stationId: 'st-1',
+    ticketNo: 'ISO-20240612-B1',
+    fieldState: '已处置',
+    leakTestPpm: 55,
+    fieldMeasure: '紧固法兰螺栓并涂抹检漏液复测',
+    fieldHandler: '张伟',
+    leakTestTime: '2024-06-12 23:10',
+    dutyState: '已隔离',
+    isolationScope: '2# 过滤器进出口法兰段，关闭前后阀门',
+    retestPpm: 0,
+    released: false,
+    dutyHandler: '王强',
+    releasedAt: '',
+    importPackageId: '',
+    dupOf: '',
+    needsReview: false,
+    createdAt: stamp(-8),
+    updatedAt: stamp(-6),
+    revision: ROW_REVISION
+  }
 ]
 
 /** 由原始行派生偏差率与异常标记 */
@@ -244,7 +353,7 @@ function buildSeedReadings(): ReadingRow[] {
 export async function seedDatabase(): Promise<void> {
   await db.transaction(
       'rw',
-      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks],
+      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks, db.isolationTickets, db.syncBatches, db.syncConflicts],
       async () => {
     await db.stations.bulkPut(SEED_STATIONS)
     await db.devices.bulkPut(SEED_DEVICES)
@@ -252,6 +361,7 @@ export async function seedDatabase(): Promise<void> {
     await db.patrols.bulkPut(SEED_PATROLS)
     await db.readings.bulkPut(buildSeedReadings())
     await db.leaks.bulkPut(SEED_LEAKS)
+    await db.isolationTickets.bulkPut(SEED_ISOLATIONS)
   })
 }
 
@@ -268,7 +378,7 @@ export async function initDatabase(): Promise<void> {
 export async function deleteStationCascade(stationId: string): Promise<void> {
   await db.transaction(
       'rw',
-      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks],
+      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks, db.isolationTickets],
       async () => {
     const devices = await db.devices.where('stationId').equals(stationId).toArray()
     await deleteDevicesInternal(devices.map((device) => device.id))
@@ -281,7 +391,7 @@ export async function deleteStationCascade(stationId: string): Promise<void> {
 export async function deleteDeviceCascade(deviceId: string): Promise<void> {
   await db.transaction(
       'rw',
-      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks],
+      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks, db.isolationTickets],
       async () => {
     await deleteDevicesInternal([deviceId])
     await db.devices.delete(deviceId)
@@ -312,6 +422,7 @@ async function deleteDevicesInternal(deviceIds: string[]): Promise<void> {
   if (deviceIds.length === 0) return
   await db.points.where('deviceId').anyOf(deviceIds).delete()
   await db.leaks.where('deviceId').anyOf(deviceIds).delete()
+  await db.isolationTickets.where('deviceId').anyOf(deviceIds).delete()
 }
 
 /* ============================ 读数写入 ============================ */
@@ -362,25 +473,27 @@ export async function recalculateReadingsOfPoint(pointId: string): Promise<void>
 /* ============================ 整库导入导出 ============================ */
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, devices, points, patrols, readings, leaks] = await Promise.all([
+  const [stations, devices, points, patrols, readings, leaks, isolations] = await Promise.all([
     db.stations.count(),
     db.devices.count(),
     db.points.count(),
     db.patrols.count(),
     db.readings.count(),
-    db.leaks.count()
+    db.leaks.count(),
+    db.isolationTickets.count()
   ])
-  return { stations, devices, points, patrols, readings, leaks }
+  return { stations, devices, points, patrols, readings, leaks, isolations }
 }
 
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [stations, devices, points, patrols, readings, leaks] = await Promise.all([
+  const [stations, devices, points, patrols, readings, leaks, isolations] = await Promise.all([
     db.stations.toArray(),
     db.devices.toArray(),
     db.points.toArray(),
     db.patrols.toArray(),
     db.readings.toArray(),
-    db.leaks.toArray()
+    db.leaks.toArray(),
+    db.isolationTickets.toArray()
   ])
   const strip = <T extends Revisioned>(row: T): Omit<T, 'revision'> => {
     const { revision: _revision, ...rest } = row
@@ -395,14 +508,15 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     points: points.map(strip),
     patrols: patrols.map(strip),
     readings: readings.map(strip),
-    leaks: leaks.map(strip)
+    leaks: leaks.map(strip),
+    isolations: isolations.map(strip)
   }
 }
 
 export async function importSnapshot(payload: BackupPayload): Promise<void> {
   await db.transaction(
       'rw',
-      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks],
+      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks, db.isolationTickets],
       async () => {
     await Promise.all([
       db.stations.clear(),
@@ -410,7 +524,8 @@ export async function importSnapshot(payload: BackupPayload): Promise<void> {
       db.points.clear(),
       db.patrols.clear(),
       db.readings.clear(),
-      db.leaks.clear()
+      db.leaks.clear(),
+      db.isolationTickets.clear()
     ])
     const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
     await db.stations.bulkPut((payload.stations ?? []).map(rev))
@@ -419,13 +534,14 @@ export async function importSnapshot(payload: BackupPayload): Promise<void> {
     await db.patrols.bulkPut((payload.patrols ?? []).map(rev))
     await db.readings.bulkPut((payload.readings ?? []).map(rev))
     await db.leaks.bulkPut((payload.leaks ?? []).map(rev))
+    await db.isolationTickets.bulkPut((payload.isolations ?? []).map(rev))
   })
 }
 
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
       'rw',
-      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks],
+      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks, db.isolationTickets, db.syncBatches, db.syncConflicts],
       async () => {
     await Promise.all([
       db.stations.clear(),
@@ -433,7 +549,10 @@ export async function clearAllTables(): Promise<void> {
       db.points.clear(),
       db.patrols.clear(),
       db.readings.clear(),
-      db.leaks.clear()
+      db.leaks.clear(),
+      db.isolationTickets.clear(),
+      db.syncBatches.clear(),
+      db.syncConflicts.clear()
     ])
   })
 }

@@ -15,6 +15,12 @@ export interface Leak {
   /** 复检浓度（ppm） */
   retestValuePpm: number
   handler: string
+  /** 由哪个回传包导入（同步溯源，手工新建为空） */
+  importPackageId?: string
+  /** 与哪张泄漏单重复（自然键冲突时两边都留，互相标记） */
+  dupOf?: string
+  /** 旧包缺隔离字段，待值班室人工确认 */
+  needsReview?: boolean
   createdAt: number
   updatedAt: number
 }

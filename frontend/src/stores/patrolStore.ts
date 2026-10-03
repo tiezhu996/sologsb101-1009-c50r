@@ -50,6 +50,10 @@ interface PatrolState_ {
   abnormalRows: () => AbnormalRow[]
   filteredPatrols: () => Patrol[]
   pointValuesOf: (patrolId: string) => Map<string, Reading>
+  /** 现场轨：录入测点读数后置「已录读」，并记录现场处置措施 */
+  markFieldRecorded: (id: string, fieldMeasure?: string) => Promise<void>
+  /** 值班轨：接收回传包 → 已接收；复检放行 → 已放行 */
+  advanceDuty: (id: string, next: '已接收' | '已放行', releaseNote?: string) => Promise<void>
 }
 
 export const usePatrolStore = create<PatrolState_>((set, get) => ({
@@ -137,8 +141,21 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
       patrolDate,
       patrolman: patrolman.trim() || '未署名',
       envNote: envNote.trim(),
+      fieldState: '已录读',
       updatedAt: Date.now()
     })
+  },
+
+  async markFieldRecorded(id, fieldMeasure) {
+    const patch: Partial<PatrolRow> = { fieldState: '已录读', updatedAt: Date.now() }
+    if (fieldMeasure !== undefined) patch.fieldMeasure = fieldMeasure.trim()
+    await db.patrols.update(id, patch)
+  },
+
+  async advanceDuty(id, next, releaseNote) {
+    const patch: Partial<PatrolRow> = { dutyState: next, updatedAt: Date.now() }
+    if (releaseNote !== undefined) patch.dutyReleaseNote = releaseNote.trim()
+    await db.patrols.update(id, patch)
   },
 
   setReadingDraft(patrolId, pointId, value) {
