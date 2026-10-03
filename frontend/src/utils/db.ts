@@ -10,10 +10,15 @@ import type { Point } from '@/types/point'
 import type { Patrol } from '@/types/patrol'
 import type { Reading } from '@/types/reading'
 import type { Leak } from '@/types/leak'
+import type { IsolationTicket } from '@/types/isolation'
+import type { ConflictRow, ImportLedgerRow, ManualQueueEntry } from '@/types/reconcile'
 import { deviationPctOf, judgeReading } from '@/utils/range'
+import { leakBizKeyOf } from '@/types/leak'
+
+export type { ConflictRow, ImportLedgerRow, ManualQueueEntry }
 
 export const DB_NAME = 'gbgaspress'
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 export const LS_KEYS = {
   dbVersion: 'gbgaspress:db-version',
@@ -38,13 +43,14 @@ export interface BackupPayload {
   patrols: Patrol[]
   readings: Reading[]
   leaks: Leak[]
+  isolationTickets: IsolationTicket[]
 }
 
 export interface Revisioned {
   revision?: number
 }
 
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 export type StationRow = Station & Revisioned
 export type DeviceRow = Device & Revisioned
@@ -52,6 +58,7 @@ export type PointRow = Point & Revisioned
 export type PatrolRow = Patrol & Revisioned
 export type ReadingRow = Reading & Revisioned
 export type LeakRow = Leak & Revisioned
+export type IsolationTicketRow = IsolationTicket & Revisioned
 
 class GasPressDatabase extends Dexie {
   stations!: Table<StationRow, string>
@@ -60,6 +67,13 @@ class GasPressDatabase extends Dexie {
   patrols!: Table<PatrolRow, string>
   readings!: Table<ReadingRow, string>
   leaks!: Table<LeakRow, string>
+  isolationTickets!: Table<IsolationTicketRow, string>
+  /** 导入台账：回传包检查点（幂等 + 断点续传） */
+  importLedger!: Table<ImportLedgerRow, string>
+  /** 冲突留痕：本地与回传两边都留 */
+  conflicts!: Table<ConflictRow, string>
+  /** 人工确认队列：旧包（缺隔离字段）挂起 */
+  manualQueue!: Table<ManualQueueEntry, string>
 
   constructor() {
     super(DB_NAME)
@@ -74,7 +88,7 @@ class GasPressDatabase extends Dexie {
     })
 
     // v2：点位/泄漏补 stationId 冗余列（按站点筛选免联表）；读数补 revision 与 note
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         stations: 'id, name, grade, updatedAt',
         devices: 'id, stationId, type, state, updatedAt',
@@ -147,6 +161,32 @@ class GasPressDatabase extends Dexie {
             }
           })
       })
+
+    // v3：隔离作业票双线状态；泄漏单补稳定业务键；新增导入台账 / 冲突留痕 / 人工确认队列
+    this.version(DB_VERSION)
+      .stores({
+        stations: 'id, name, grade, updatedAt',
+        devices: 'id, stationId, type, state, updatedAt',
+        points: 'id, deviceId, stationId, name, isCritical, updatedAt',
+        patrols: 'id, stationId, planDate, state, updatedAt',
+        readings: 'id, patrolId, pointId, isAbnormal, updatedAt',
+        leaks: 'id, deviceId, stationId, bizKey, state, handler, updatedAt',
+        isolationTickets: 'id, ticketNo, deviceId, stationId, leakId, fieldState, dutyState, updatedAt',
+        importLedger: 'id, packageId, status, updatedAt',
+        conflicts: 'id, packageId, kind, bizKey, localId, status, updatedAt',
+        manualQueue: 'id, packageId, status, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 泄漏单补稳定业务键，老数据按 设备 + 发现日 + 浓度档位 归并
+        await tx
+          .table('leaks')
+          .toCollection()
+          .modify((leak: Record<string, unknown>) => {
+            if (typeof leak.bizKey !== 'string' || leak.bizKey.length === 0) {
+              leak.bizKey = leakBizKeyOf(String(leak.deviceId ?? ''), String(leak.foundTime ?? ''), Number(leak.concentrationPpm))
+            }
+          })
+      })
   }
 }
 
@@ -214,9 +254,91 @@ const SEED_READING_ROWS: Array<[string, string, number, string]> = [
 ]
 
 const SEED_LEAKS: LeakRow[] = [
-  { id: 'lk-1', deviceId: 'dv-1', stationId: 'st-1', concentrationPpm: 68, foundTime: '2024-06-05', measure: '更换调压器阀体密封垫并做气密试验', state: '已复检', retestValuePpm: 32, handler: '张伟', createdAt: stamp(-15), updatedAt: stamp(-10), revision: ROW_REVISION },
-  { id: 'lk-2', deviceId: 'dv-2', stationId: 'st-1', concentrationPpm: 55, foundTime: '2024-06-12', measure: '紧固法兰螺栓并涂抹检漏液复测', state: '已处置', retestValuePpm: 0, handler: '张伟', createdAt: stamp(-8), updatedAt: stamp(-6), revision: ROW_REVISION },
-  { id: 'lk-3', deviceId: 'dv-4', stationId: 'st-2', concentrationPpm: 88, foundTime: '2024-06-08', measure: '', state: '待处置', retestValuePpm: 0, handler: '', createdAt: stamp(-12), updatedAt: stamp(-12), revision: ROW_REVISION }
+  { id: 'lk-1', deviceId: 'dv-1', stationId: 'st-1', bizKey: leakBizKeyOf('dv-1', '2024-06-05', 68), concentrationPpm: 68, foundTime: '2024-06-05', measure: '更换调压器阀体密封垫并做气密试验', state: '已复检', retestValuePpm: 32, handler: '张伟', createdAt: stamp(-15), updatedAt: stamp(-10), revision: ROW_REVISION },
+  { id: 'lk-2', deviceId: 'dv-2', stationId: 'st-1', bizKey: leakBizKeyOf('dv-2', '2024-06-12', 55), concentrationPpm: 55, foundTime: '2024-06-12', measure: '紧固法兰螺栓并涂抹检漏液复测', state: '已处置', retestValuePpm: 0, handler: '张伟', createdAt: stamp(-8), updatedAt: stamp(-6), revision: ROW_REVISION },
+  { id: 'lk-3', deviceId: 'dv-4', stationId: 'st-2', bizKey: leakBizKeyOf('dv-4', '2024-06-08', 88), concentrationPpm: 88, foundTime: '2024-06-08', measure: '', state: '待处置', retestValuePpm: 0, handler: '', createdAt: stamp(-12), updatedAt: stamp(-12), revision: ROW_REVISION }
+]
+
+/** 夜间抢修隔离作业票播种：现场轨（测点读数+措施）与值班轨（隔离范围+复检放行）分开推进 */
+const SEED_ISOLATION_TICKETS: IsolationTicketRow[] = [
+  {
+    id: 'iso-1',
+    ticketNo: 'ISO-20240605-01',
+    deviceId: 'dv-1',
+    stationId: 'st-1',
+    leakId: 'lk-1',
+    fieldState: '已处置',
+    measurePointReadings: [
+      { id: 'mr-1', pointName: '调压器阀体密封处', valuePpm: 68, measuredAt: '2024-06-05 02:15' },
+      { id: 'mr-2', pointName: '调压器阀体密封处', valuePpm: 32, measuredAt: '2024-06-10 10:30' }
+    ],
+    measure: '更换阀体密封垫并做气密试验',
+    fieldOperator: '张伟',
+    measuredAt: '2024-06-10 10:30',
+    fieldUpdatedAt: stamp(-10),
+    dutyState: '已放行',
+    isolationScope: '关闭城东调压站 1# 进出口球阀，泄压后挂「禁止合闸」牌',
+    isolatedBy: '王强',
+    isolatedAt: '2024-06-05 02:30',
+    retestApproved: true,
+    retestApprover: '王强',
+    retestApprovedAt: '2024-06-10 11:00',
+    dutyUpdatedAt: stamp(-10),
+    createdAt: stamp(-15),
+    updatedAt: stamp(-10),
+    revision: ROW_REVISION
+  },
+  {
+    id: 'iso-2',
+    ticketNo: 'ISO-20240612-01',
+    deviceId: 'dv-2',
+    stationId: 'st-1',
+    leakId: 'lk-2',
+    fieldState: '已处置',
+    measurePointReadings: [
+      { id: 'mr-3', pointName: '过滤器进口法兰', valuePpm: 55, measuredAt: '2024-06-12 23:40' },
+      { id: 'mr-4', pointName: '过滤器进口法兰', valuePpm: 48, measuredAt: '2024-06-13 01:20' }
+    ],
+    measure: '紧固法兰螺栓并涂抹检漏液复测',
+    fieldOperator: '张伟',
+    measuredAt: '2024-06-13 01:20',
+    fieldUpdatedAt: stamp(-6),
+    dutyState: '已隔离',
+    isolationScope: '关闭过滤器前后截止阀并泄压，现场围挡',
+    isolatedBy: '王强',
+    isolatedAt: '2024-06-12 23:55',
+    retestApproved: false,
+    retestApprover: '',
+    retestApprovedAt: '',
+    dutyUpdatedAt: stamp(-6),
+    createdAt: stamp(-8),
+    updatedAt: stamp(-6),
+    revision: ROW_REVISION
+  },
+  {
+    id: 'iso-3',
+    ticketNo: 'ISO-20240608-01',
+    deviceId: 'dv-4',
+    stationId: 'st-2',
+    leakId: 'lk-3',
+    fieldState: '测漏中',
+    measurePointReadings: [{ id: 'mr-5', pointName: '调压器阀体密封处', valuePpm: 88, measuredAt: '2024-06-08 03:05' }],
+    measure: '',
+    fieldOperator: '李娜',
+    measuredAt: '2024-06-08 03:05',
+    fieldUpdatedAt: stamp(-12),
+    dutyState: '待划定',
+    isolationScope: '',
+    isolatedBy: '',
+    isolatedAt: '',
+    retestApproved: false,
+    retestApprover: '',
+    retestApprovedAt: '',
+    dutyUpdatedAt: stamp(-12),
+    createdAt: stamp(-12),
+    updatedAt: stamp(-12),
+    revision: ROW_REVISION
+  }
 ]
 
 /** 由原始行派生偏差率与异常标记 */
@@ -244,7 +366,7 @@ function buildSeedReadings(): ReadingRow[] {
 export async function seedDatabase(): Promise<void> {
   await db.transaction(
       'rw',
-      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks],
+      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks, db.isolationTickets],
       async () => {
     await db.stations.bulkPut(SEED_STATIONS)
     await db.devices.bulkPut(SEED_DEVICES)
@@ -252,6 +374,7 @@ export async function seedDatabase(): Promise<void> {
     await db.patrols.bulkPut(SEED_PATROLS)
     await db.readings.bulkPut(buildSeedReadings())
     await db.leaks.bulkPut(SEED_LEAKS)
+    await db.isolationTickets.bulkPut(SEED_ISOLATION_TICKETS)
   })
 }
 
@@ -312,6 +435,7 @@ async function deleteDevicesInternal(deviceIds: string[]): Promise<void> {
   if (deviceIds.length === 0) return
   await db.points.where('deviceId').anyOf(deviceIds).delete()
   await db.leaks.where('deviceId').anyOf(deviceIds).delete()
+  await db.isolationTickets.where('deviceId').anyOf(deviceIds).delete()
 }
 
 /* ============================ 读数写入 ============================ */
@@ -362,25 +486,27 @@ export async function recalculateReadingsOfPoint(pointId: string): Promise<void>
 /* ============================ 整库导入导出 ============================ */
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, devices, points, patrols, readings, leaks] = await Promise.all([
+  const [stations, devices, points, patrols, readings, leaks, isolationTickets] = await Promise.all([
     db.stations.count(),
     db.devices.count(),
     db.points.count(),
     db.patrols.count(),
     db.readings.count(),
-    db.leaks.count()
+    db.leaks.count(),
+    db.isolationTickets.count()
   ])
-  return { stations, devices, points, patrols, readings, leaks }
+  return { stations, devices, points, patrols, readings, leaks, isolationTickets }
 }
 
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [stations, devices, points, patrols, readings, leaks] = await Promise.all([
+  const [stations, devices, points, patrols, readings, leaks, isolationTickets] = await Promise.all([
     db.stations.toArray(),
     db.devices.toArray(),
     db.points.toArray(),
     db.patrols.toArray(),
     db.readings.toArray(),
-    db.leaks.toArray()
+    db.leaks.toArray(),
+    db.isolationTickets.toArray()
   ])
   const strip = <T extends Revisioned>(row: T): Omit<T, 'revision'> => {
     const { revision: _revision, ...rest } = row
@@ -395,14 +521,15 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     points: points.map(strip),
     patrols: patrols.map(strip),
     readings: readings.map(strip),
-    leaks: leaks.map(strip)
+    leaks: leaks.map(strip),
+    isolationTickets: isolationTickets.map(strip)
   }
 }
 
 export async function importSnapshot(payload: BackupPayload): Promise<void> {
   await db.transaction(
       'rw',
-      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks],
+      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks, db.isolationTickets],
       async () => {
     await Promise.all([
       db.stations.clear(),
@@ -410,7 +537,8 @@ export async function importSnapshot(payload: BackupPayload): Promise<void> {
       db.points.clear(),
       db.patrols.clear(),
       db.readings.clear(),
-      db.leaks.clear()
+      db.leaks.clear(),
+      db.isolationTickets.clear()
     ])
     const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
     await db.stations.bulkPut((payload.stations ?? []).map(rev))
@@ -418,14 +546,22 @@ export async function importSnapshot(payload: BackupPayload): Promise<void> {
     await db.points.bulkPut((payload.points ?? []).map(rev))
     await db.patrols.bulkPut((payload.patrols ?? []).map(rev))
     await db.readings.bulkPut((payload.readings ?? []).map(rev))
-    await db.leaks.bulkPut((payload.leaks ?? []).map(rev))
+    // 老备份无 bizKey，导入时按稳定业务键补齐
+    await db.leaks.bulkPut(
+      (payload.leaks ?? []).map((row) => ({
+        ...row,
+        bizKey: row.bizKey || leakBizKeyOf(row.deviceId, row.foundTime, row.concentrationPpm),
+        revision: ROW_REVISION
+      }))
+    )
+    await db.isolationTickets.bulkPut((payload.isolationTickets ?? []).map(rev))
   })
 }
 
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
       'rw',
-      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks],
+      [db.stations, db.devices, db.points, db.patrols, db.readings, db.leaks, db.isolationTickets],
       async () => {
     await Promise.all([
       db.stations.clear(),
@@ -433,7 +569,8 @@ export async function clearAllTables(): Promise<void> {
       db.points.clear(),
       db.patrols.clear(),
       db.readings.clear(),
-      db.leaks.clear()
+      db.leaks.clear(),
+      db.isolationTickets.clear()
     ])
   })
 }

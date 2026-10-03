@@ -7,6 +7,7 @@ import { liveQuery } from 'dexie'
 import { createId, db, type LeakRow } from '@/utils/db'
 import {
   LEAK_RETEST_PASS_PPM,
+  leakBizKeyOf,
   retestPassed,
   type Leak,
   type LeakDraft,
@@ -61,12 +62,16 @@ export const useLeakStore = create<LeakState_>((set, get) => ({
 
   async createLeak(draft) {
     const device = await db.devices.get(draft.deviceId)
+    const stationId = device ? device.stationId : ''
+    const concentration = Number(draft.concentrationPpm) || 0
+    const bizKey = leakBizKeyOf(draft.deviceId, draft.foundTime, concentration)
     const now = Date.now()
     const row: LeakRow = {
       id: createId('lk'),
       deviceId: draft.deviceId,
-      stationId: device ? device.stationId : '',
-      concentrationPpm: Number(draft.concentrationPpm) || 0,
+      stationId,
+      bizKey,
+      concentrationPpm: concentration,
       foundTime: draft.foundTime,
       measure: draft.measure.trim(),
       state: draft.state,

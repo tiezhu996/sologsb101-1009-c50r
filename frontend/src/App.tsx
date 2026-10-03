@@ -7,6 +7,8 @@ import { ROUTES } from './router'
 import { useStationStore } from './stores/stationStore'
 import { usePatrolStore } from './stores/patrolStore'
 import { useLeakStore } from './stores/leakStore'
+import { useIsolationStore } from './stores/isolationStore'
+import { useSyncStore } from './stores/syncStore'
 import { usePatrolGap } from './hooks/usePatrolGap'
 
 export default function App() {
@@ -15,6 +17,8 @@ export default function App() {
   const stationStore = useStationStore()
   const patrolStore = usePatrolStore()
   const leakStore = useLeakStore()
+  const isolationStore = useIsolationStore()
+  const syncStore = useSyncStore()
   const gap = usePatrolGap(patrolStore.patrols)
 
   const currentStation = stationStore.currentStation()
@@ -25,6 +29,8 @@ export default function App() {
     { path: ROUTES.patrols, label: '巡检录入', count: patrolStore.patrols.length },
     { path: ROUTES.abnormal, label: '异常分级', count: patrolStore.abnormalRows().length },
     { path: ROUTES.leaks, label: '泄漏处置', count: leakStore.counts()['待处置'] },
+    { path: ROUTES.isolations, label: '隔离作业票', count: isolationStore.tickets.filter((ticket) => ticket.dutyState !== '已放行').length },
+    { path: ROUTES.sync, label: '回传对账', count: syncStore.pendingConflicts().length + syncStore.pendingManual().length },
     { path: ROUTES.plans, label: '巡检计划', count: gap.overdueCount }
   ]
 
